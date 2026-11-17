@@ -179,11 +179,13 @@ Los nombres admiten prefijo único: `/off lamp` apaga `lampara_salon` si es el
 
 ## Arranque automático
 
-- **Docker / NAS**: ver `docker-compose.yml`. Copia `.env.example` a `.env`,
-  rellena `REPO_URL`, `TELEGRAM_TOKEN`, `ALLOWED_USER_ID`, `DEVICES_JSON` (JSON
-  en una línea) y `DATA_PATH` (carpeta del NAS para `schedules.json`).
-  `network_mode: host` es necesario para alcanzar los enchufes por IP local y
-  `stop_grace_period: 30s` da tiempo a apagar los enchufes al detener el contenedor.
+- **Docker / NAS**: hay una plantilla en `docker-compose.yml.example` (sin
+  secretos). Copia/cámbiale el nombre a `docker-compose.yml`, rellena
+  `REPO_URL`, `TELEGRAM_TOKEN`, `ALLOWED_USER_ID` y `DEVICES_JSON` (JSON en una
+  línea; genéralo con `./gen-env-devices.sh`). El `docker-compose.yml` real está
+  en el `.gitignore` para no subir las claves. `network_mode: host` es necesario
+  para alcanzar los enchufes por IP local y `stop_grace_period: 30s` da tiempo a
+  apagar los enchufes al detener el contenedor.
   Uso: `docker compose up -d`.
 - **Linux / Raspberry Pi (systemd)**: crea `/etc/systemd/system/garza-bot.service`
   con `ExecStart=/ruta/al/venv/bin/python /ruta/a/bot.py`, `WorkingDirectory=/ruta/a`,
