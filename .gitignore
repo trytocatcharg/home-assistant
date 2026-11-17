@@ -152,6 +152,9 @@ activemq-data/
 # Credenciales del bot y de los enchufes Tuya
 config.json
 devices.json
+schedules.json
+.env
+data/
 tinytuya.json
 tuya-raw.json
 snapshot*.json
@@ -228,3 +231,4 @@ __marimo__/
 snapshot.json
 tinytuya.json
 tuya-raw.json
+.env.example
