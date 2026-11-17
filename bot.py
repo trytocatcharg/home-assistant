@@ -26,6 +26,10 @@ MADRID = ZoneInfo("Europe/Madrid")
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
+# httpx loguea las URLs de las llamadas a la API de Telegram con el token
+# en claro (INFO "HTTP Request..."); subirlo a WARNING para no exponerlo
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("garza-bot")
 
 # Config por variables de entorno (Docker) con fallback a config.json local
