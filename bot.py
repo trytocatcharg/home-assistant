@@ -5,7 +5,9 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+import random
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -143,8 +145,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔌 *Control Garza Smart*\n\n"
         "/status — estado y consumo de todos los enchufes\n"
         "/switch [nombre] — alternar encendido/apagado\n"
-        "/schedule <nombre> <HH:MM> <on|off> [diario|una\\_vez] — programar "
-        "(por defecto, cada día a esa hora de Madrid)\n"
+        "/schedule — programar (presencia aleatoria u horario fijo)\n"
         "/schedules — ver programaciones activas\n"
         "/unschedule <id> — cancelar una programación\n\n"
         f"Enchufes disponibles: {nombres}"
@@ -310,26 +311,101 @@ def remove_schedule(job_id: str):
     save_schedules([s for s in load_schedules() if s["id"] != job_id])
 
 
+def roll_presencia(base: datetime) -> tuple[datetime, datetime]:
+    """Tira los dados del dia: ON entre 18:00 y 18:29,
+    OFF entre 19:30 y 19:59 (independiente por enchufe)."""
+    on_time = base.replace(hour=18, minute=0, second=0, microsecond=0) + timedelta(
+        minutes=random.randint(0, 29)
+    )
+    off_time = base.replace(hour=19, minute=30, second=0, microsecond=0) + timedelta(
+        minutes=random.randint(0, 29)
+    )
+    if off_time <= on_time:
+        off_time = on_time + timedelta(minutes=1)
+    return on_time, off_time
+
+
+async def _run_planner():
+    update_schedule("presencia-planner", last_run=datetime.now(MADRID).isoformat())
+    await planificar_hoy()
+
+
+async def planificar_hoy() -> dict:
+    """Para cada entrada 'presencia' sin planificar hoy: tira los dados y crea
+    los dos eventos puntuales del dia. Devuelve {key: (on, off)}."""
+    ahora = datetime.now(MADRID)
+    hoy = ahora.date().isoformat()
+    veces = {}
+    for s in load_schedules():
+        if s["mode"] != "presencia" or s.get("today") == hoy:
+            continue
+        keys = [k for k in s["keys"] if k in DEVICES]
+        for key in keys:
+            on_time, off_time = roll_presencia(ahora)
+            if off_time <= ahora:
+                continue  # ventana de hoy ya pasada
+            veces[key] = (on_time, off_time)
+            for accion, cuando in (("on", on_time), ("off", off_time)):
+                job_id = f"{key}-presencia-{hoy}-{accion}"
+                persist_schedule(
+                    job_id, [key], accion, "una_vez",
+                    cuando.hour, cuando.minute, run_date=cuando,
+                )
+                scheduler.add_job(
+                    _run_scheduled,
+                    DateTrigger(run_date=cuando),
+                    args=[DEVICES[key], accion, job_id, "una_vez"],
+                    id=job_id,
+                    replace_existing=True,
+                    name=job_id,
+                )
+        cambios = {"today": hoy}
+        if len(keys) == 1 and keys[0] in veces:
+            cambios["today_on"] = veces[keys[0]][0].isoformat()
+            cambios["today_off"] = veces[keys[0]][1].isoformat()
+        update_schedule(s["id"], **cambios)
+    return veces
+
+
 async def recover_schedules():
     """Al arrancar: recrea los jobs desde disco y ejecuta los que debieron
     dispararse mientras el bot estaba parado."""
     ahora = datetime.now(MADRID)
+    hoy = ahora.date().isoformat()
+    hay_que_planificar = False
     for s in load_schedules():
-        keys = [k for k in s["keys"] if k in DEVICES]
+        mode = s["mode"]
+        keys = [k for k in s.get("keys", []) if k in DEVICES]
+        if mode == "planner":
+            scheduler.add_job(
+                _run_planner,
+                CronTrigger(hour=s["hour"], minute=s["minute"], timezone=MADRID),
+                id=s["id"],
+                replace_existing=True,
+                name=s["id"],
+            )
+            ultima = s.get("last_run")
+            if not ultima or datetime.fromisoformat(ultima).astimezone(MADRID).date().isoformat() < hoy:
+                hay_que_planificar = True
+            continue
+        if mode == "presencia":
+            if s.get("today") != hoy:
+                hay_que_planificar = True
+            continue
         if not keys:
             remove_schedule(s["id"])
             continue
-        if s["mode"] == "diario":
-            hoy = ahora.replace(hour=s["hour"], minute=s["minute"], second=0, microsecond=0)
+        if mode == "diario":
+            hoy_dt = ahora.replace(hour=s["hour"], minute=s["minute"], second=0, microsecond=0)
             ultima = None
             if s.get("last_run"):
                 ultima = datetime.fromisoformat(s["last_run"]).astimezone(MADRID)
-            if hoy <= ahora and (ultima is None or ultima < hoy):
+            if hoy_dt <= ahora and (ultima is None or ultima < hoy_dt):
                 log.info("Recuperando schedule perdido: %s", s["id"])
                 update_schedule(s["id"], last_run=ahora.isoformat())
                 await _apply_to_keys(keys, s["action"])
             trigger = CronTrigger(hour=s["hour"], minute=s["minute"], timezone=MADRID)
-        else:
+        else:  # una_vez
             run_date = datetime.fromisoformat(s["run_date"]).astimezone(MADRID)
             if run_date <= ahora:
                 log.info("Recuperando schedule unico perdido: %s", s["id"])
@@ -346,6 +422,8 @@ async def recover_schedules():
                 replace_existing=True,
                 name=s["id"],
             )
+    if hay_que_planificar:
+        await planificar_hoy()
 
 
 async def _apply_to_keys(keys: list, action: str):
@@ -358,6 +436,20 @@ async def _apply_to_keys(keys: list, action: str):
 
 async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
+        return
+    if not context.args:
+        teclado = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(
+                    "🎲 Presencia diaria (ON 18:00–18:29 / OFF 19:30–19:59)",
+                    callback_data="sch:menu:presencia")],
+                [InlineKeyboardButton("✏️ Horario custom",
+                                      callback_data="sch:menu:custom")],
+            ]
+        )
+        await update.message.reply_text(
+            "¿Qué programación quieres crear?", reply_markup=teclado
+        )
         return
     uso = (
         "❌ Uso: `/schedule <nombre> <HH:MM> <on|off> [diario|una_vez]`\n"
@@ -415,17 +507,67 @@ async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(creadas), parse_mode="Markdown")
 
 
+async def schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_authorized(update):
+        await query.answer("No autorizado", show_alert=True)
+        return
+    await query.answer()
+    opcion = query.data.split(":")[2]
+    if opcion == "custom":
+        await query.edit_message_text(
+            "✏️ *Horario custom* — escribe el comando directamente:\n"
+            "`/schedule <nombre> <HH:MM> <on|off> [diario|una_vez]`\n"
+            "Ejemplo: `/schedule lámpara_salon 22:30 off`",
+            parse_mode="Markdown",
+        )
+        return
+    # Activar presencia para TODOS los enchufes, dados independientes por uno
+    for key in DEVICES:
+        persist_schedule(f"{key}-presencia", [key], "presencia", "presencia", 18, 0)
+    persist_schedule("presencia-planner", [], "plan", "planner", 0, 5)
+    scheduler.add_job(
+        _run_planner,
+        CronTrigger(hour=0, minute=5, timezone=MADRID),
+        id="presencia-planner",
+        replace_existing=True,
+        name="presencia-planner",
+    )
+    veces = await planificar_hoy()
+    lineas = ["🎲 *Presencia diaria activada* — dados independientes por enchufe:"]
+    for key, (on_time, off_time) in veces.items():
+        lineas.append(
+            f"- {DEVICES[key]['label']}: ON {on_time:%H:%M} / OFF {off_time:%H:%M} (hoy)"
+        )
+    if not veces:
+        lineas.append("- Hoy la ventana ya pasó; los dados se tiran esta noche a las 00:05.")
+    lineas.append("\nCada día cambia. Cancelar: `/unschedule <nombre>-presencia`")
+    await query.edit_message_text("\n".join(lineas), parse_mode="Markdown")
+
+
 async def schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    jobs = scheduler.get_jobs()
-    if not jobs:
-        await update.message.reply_text("📭 No hay programaciones activas.")
-        return
     lineas = ["📅 *Programaciones activas (hora de Madrid):*"]
-    for j in jobs:
+    nombres_vistos = set()
+    for j in scheduler.get_jobs():
+        if j.id == "presencia-planner" or re.search(r"-presencia-\d{4}-\d{2}-\d{2}-", j.id):
+            continue  # ruido interno del modo presencia
+        nombres_vistos.add(j.id)
         proxima = j.next_run_time.astimezone(MADRID).strftime("%d/%m %H:%M")
         lineas.append(f"- `{j.id}` → {j.name} (próxima: {proxima})")
+    for s in load_schedules():
+        if s["mode"] != "presencia" or s["id"] in nombres_vistos:
+            continue
+        detalle = ""
+        if s.get("today_on") and s.get("today_off"):
+            on = datetime.fromisoformat(s["today_on"]).astimezone(MADRID)
+            off = datetime.fromisoformat(s["today_off"]).astimezone(MADRID)
+            detalle = f" — hoy ON {on:%H:%M} / OFF {off:%H:%M}"
+        lineas.append(f"- `{s['id']}` → presencia diaria{detalle} (dados a las 00:05)")
+    if len(lineas) == 1:
+        await update.message.reply_text("📭 No hay programaciones activas.")
+        return
     await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
 
@@ -438,13 +580,23 @@ async def unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
-    job = scheduler.get_job(context.args[0])
-    if job is None:
-        await update.message.reply_text(f"❌ No existe `{context.args[0]}`.", parse_mode="Markdown")
+    job_id = context.args[0]
+    job = scheduler.get_job(job_id)
+    if job is not None:
+        job.remove()
+    elif not any(s["id"] == job_id for s in load_schedules()):
+        await update.message.reply_text(f"❌ No existe `{job_id}`.", parse_mode="Markdown")
         return
-    job.remove()
-    remove_schedule(job.id)
-    await update.message.reply_text(f"🗑️ Eliminada `{job.id}`.", parse_mode="Markdown")
+    remove_schedule(job_id)
+    # Si es una entrada presencia, limpiar tambien los eventos del dia
+    prefijo = job_id + "-"
+    for s in load_schedules():
+        if s["id"].startswith(prefijo):
+            j = scheduler.get_job(s["id"])
+            if j:
+                j.remove()
+            remove_schedule(s["id"])
+    await update.message.reply_text(f"🗑️ Eliminada `{job_id}`.", parse_mode="Markdown")
 
 
 _scheduler_started = False
@@ -461,7 +613,7 @@ async def on_startup(app: Application):
             ("start", "Ayuda y lista de enchufes"),
             ("status", "Estado y consumo de todos los enchufes"),
             ("switch", "Alternar enchufes: /switch o /switch <nombre>"),
-            ("schedule", "Programar: /schedule <nombre> <HH:MM> <on|off> [diario|una_vez]"),
+            ("schedule", "Programar: presencia aleatoria u horario custom"),
             ("schedules", "Ver programaciones activas"),
             ("unschedule", "Cancelar: /unschedule <id>"),
         ]
@@ -507,6 +659,7 @@ def main():
     app.add_handler(CommandHandler("schedules", schedules))
     app.add_handler(CommandHandler("unschedule", unschedule))
     app.add_handler(CallbackQueryHandler(switch_callback, pattern=r"^sw:"))
+    app.add_handler(CallbackQueryHandler(schedule_callback, pattern=r"^sch:"))
 
     log.info("Arrancando bot...")
     app.run_polling()
