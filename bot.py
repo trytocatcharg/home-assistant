@@ -146,6 +146,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — estado y consumo de todos los enchufes\n"
         "/switch [nombre] — alternar encendido/apagado\n"
         "/schedule — programar (presencia aleatoria u horario fijo)\n"
+        "/test — encendido aleatorio (0-10 min), apagado 1 min después\n"
         "/schedules — ver programaciones activas\n"
         "/unschedule <id> — cancelar una programación\n\n"
         f"Enchufes disponibles: {nombres}"
@@ -545,6 +546,31 @@ async def schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("\n".join(lineas), parse_mode="Markdown")
 
 
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+    ahora = datetime.now(MADRID)
+    lineas = ["🧪 *Test de tirada* — encendido aleatorio en los próximos 10 minutos (apagado 1 min después):"]
+    for key, entry in DEVICES.items():
+        when = (ahora + timedelta(minutes=random.randint(0, 9))).replace(second=0, microsecond=0)
+        if when <= ahora:
+            when += timedelta(minutes=1)
+        apagado = when + timedelta(minutes=1)
+        for accion, momento in (("on", when), ("off", apagado)):
+            job_id = f"{key}-test-{momento:%H%M}-{accion}"
+            persist_schedule(job_id, [key], accion, "una_vez", momento.hour, momento.minute, run_date=momento)
+            scheduler.add_job(
+                _run_scheduled,
+                DateTrigger(run_date=momento),
+                args=[entry, accion, job_id, "una_vez"],
+                id=job_id,
+                replace_existing=True,
+                name=f"test {entry['label']} {accion} {momento:%H:%M}",
+            )
+        lineas.append(f"- {entry['label']}: ON `{when:%H:%M}` → OFF `{apagado:%H:%M}`")
+    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
+
+
 async def schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
@@ -616,6 +642,7 @@ async def on_startup(app: Application):
             ("schedule", "Programar: presencia aleatoria u horario custom"),
             ("schedules", "Ver programaciones activas"),
             ("unschedule", "Cancelar: /unschedule <id>"),
+            ("test", "Test: enciende y apaga todo con hora aleatoria (0-10 min)"),
         ]
     )
     log.info("Bot en ejecución con %d enchufe(s): %s", len(DEVICES), ", ".join(DEVICES))
@@ -658,6 +685,7 @@ def main():
     app.add_handler(CommandHandler("schedule", schedule))
     app.add_handler(CommandHandler("schedules", schedules))
     app.add_handler(CommandHandler("unschedule", unschedule))
+    app.add_handler(CommandHandler("test", test))
     app.add_handler(CallbackQueryHandler(switch_callback, pattern=r"^sw:"))
     app.add_handler(CallbackQueryHandler(schedule_callback, pattern=r"^sch:"))
 
